@@ -1,0 +1,18 @@
+# PlatformIO
+.pio/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# VS Code
+.vscode/
+
+# Build artifacts
+*.uf2
+*.bin
+
+# OS
+.DS_Store
+Thumbs.db

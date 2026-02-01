@@ -1,0 +1,18 @@
+ESP Flash ID wird abgefragt...
+Warning: Deprecated: Command 'flash_id' is deprecated. Use 'flash-id' instead.
+esptool v5.1.0
+Connected to ESP32-C3 on COM7:
+Chip type:          ESP32-C3 (QFN32) (revision v0.3)
+Features:           Wi-Fi, BT 5 (LE), Single Core, 160MHz
+Crystal frequency:  40MHz
+MAC:                68:67:25:4f:8e:3c
+
+Stub flasher running.
+
+Flash Memory Information:
+=========================
+Manufacturer: 5e
+Device: 4016
+Detected flash size: 4MB
+
+Hard resetting via RTS pin...

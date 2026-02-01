@@ -1,0 +1,20 @@
+ESP Flash ID wird abgefragt...
+Warning: Deprecated: Command 'flash_id' is deprecated. Use 'flash-id' instead.
+esptool v5.1.0
+Connected to ESP32-C3 on COM11:
+Chip type:          ESP32-C3 (QFN32) (revision v0.4)
+Features:           Wi-Fi, BT 5 (LE), Single Core, 160MHz, Embedded Flash 4MB (XMC)
+Crystal frequency:  40MHz
+USB mode:           USB-Serial/JTAG
+MAC:                20:6e:f1:6a:a3:b8
+
+Stub flasher running.
+
+Flash Memory Information:
+=========================
+Manufacturer: 46
+Device: 4016
+Detected flash size: 4MB
+
+Hard resetting via RTS pin...
+Drücken Sie eine beliebige Taste . . . 
