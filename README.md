@@ -1,407 +1,107 @@
 # ESP-NOW Wireless HID Framework
 
-## Übersicht
+## Overview
+This project builds a low-latency, wireless USB HID bridge using:
+- ESP32-C3 (sender input device)
+- ESP32-C3 (receiver/dongle)
+- Raspberry Pi Pico (USB HID bridge)
 
-Dieses Framework ermöglicht die Entwicklung von kabellosen USB-HID-Geräten (Tastatur, Maus, Controller, etc.) basierend auf ESP32-C3 und Raspberry Pi Pico.
-
-```
-┌─────────────────┐     ESP-NOW      ┌─────────────────┐      UART       ┌─────────────────┐      USB HID
-│   ESP-Sender    │ ──────────────► │  ESP-Receiver   │ ──────────────► │   Pico Bridge   │ ──────────────► PC
-│  (Eingabegerät) │ ◄────────────── │    (Dongle)     │ ◄────────────── │  (USB Adapter)  │ ◄──────────────
-│                 │     ESP-NOW      │                 │      UART       │                 │    USB Serial
-│  GPIO 0-7       │                  │  GPIO 20/21     │                 │  GP0/GP1        │
-│  LED GPIO 8     │                  │                 │                 │                 │
-└─────────────────┘                  └─────────────────┘                 └─────────────────┘
-     COM11                                COM13                              COM15
-```
+Data path:
+ESP Sender -> ESP-NOW -> ESP Receiver -> UART -> Pico -> USB HID
 
 ## Hardware
+- 2x ESP32-C3 Super Mini (sender + receiver)
+- 1x Raspberry Pi Pico (USB HID bridge)
+- Buttons on GPIO0..GPIO7 (active LOW)
+- LED on GPIO8 (sender)
 
-### Benötigte Komponenten
+UART wiring (ESP receiver <-> Pico):
+- ESP GPIO21 (TX) -> Pico GP1 (RX)
+- ESP GPIO20 (RX) -> Pico GP0 (TX)
+- GND -> GND
 
-| Komponente | Anzahl | Beschreibung |
-|------------|--------|--------------|
-| ESP32-C3 Super Mini | 2 | Sender + Receiver |
-| Raspberry Pi Pico | 1 | USB HID Bridge |
-| Taster | 1-8 | Für Tasteneingabe |
-| Verbindungskabel | 3 | UART-Verbindung |
-
-### Pin-Belegung
-
-#### ESP-Sender (Eingabegerät)
-| GPIO | Funktion | Beschreibung |
-|------|----------|--------------|
-| 0-7 | Taster | Aktiv LOW, interner Pull-Up |
-| 8 | LED | Blaue Status-LED |
-
-#### ESP-Receiver (Dongle)
-| GPIO | Funktion | Beschreibung |
-|------|----------|--------------|
-| 20 | UART RX | Empfang vom Pico |
-| 21 | UART TX | Senden zum Pico |
-
-#### Raspberry Pi Pico
-| GPIO | Funktion | Beschreibung |
-|------|----------|--------------|
-| GP0 | UART TX | Senden zum ESP |
-| GP1 | UART RX | Empfang vom ESP |
-| USB | HID + CDC | Tastatur + Serial |
-
-### Verkabelung ESP-Receiver ↔ Pico
+## Protocol v1 (Binary, Low-Latency)
+All ESP-NOW + UART traffic uses a compact binary frame:
 
 ```
-ESP-Receiver          Pico
-    GPIO 21 (TX) ──────► GP1 (RX)
-    GPIO 20 (RX) ◄────── GP0 (TX)
-    GND          ◄─────► GND
+SYNC0 SYNC1 VER TYPE SENDER SEQ LEN PAYLOAD... CRC8
+ 0xA5  0x5A  1   T   ID     N   L   L bytes  CRC
 ```
 
-## Software-Architektur
+Types:
+- 0x01 KEY_EVENT: payload = [keycode, action] (action: 1=press, 0=release)
+- 0x02 KEY_STATE: payload = [bitmask_lo, bitmask_hi]
+- 0x10 CONTROL: payload = [cmd, value] (cmd 1 = LED)
 
-### Kommunikationsprotokolle
-
-#### Tastatur-Nachrichten (Sender → PC)
-```
-Format: KEY:<taste>:<status>\n
-Beispiele:
-  KEY:0:1   → Taste '0' gedrückt
-  KEY:0:0   → Taste '0' losgelassen
-  KEY:a:1   → Taste 'a' gedrückt
-```
-
-#### LED-Befehle (PC → Sender)
-```
-Format: LED:<status>
-Beispiele:
-  LED:1     → LED einschalten
-  LED:0     → LED ausschalten
-```
-
-### Datenfluss
-
-#### Tastendruck → PC
-1. **ESP-Sender**: GPIO-Interrupt erkennt Tastendruck
-2. **ESP-Sender**: Sendet `KEY:x:1` via ESP-NOW
-3. **ESP-Receiver**: Empfängt ESP-NOW, leitet an UART
-4. **Pico**: Empfängt UART, ruft `Keyboard.press(key)` auf
-5. **PC**: Erhält HID Keyboard Event
-
-#### LED-Steuerung vom PC
-1. **PC**: Sendet `LED:1` via USB Serial
-2. **Pico**: Empfängt Serial, leitet an UART
-3. **ESP-Receiver**: Empfängt UART, sendet via ESP-NOW
-4. **ESP-Sender**: Empfängt ESP-NOW, schaltet GPIO8
-
-## Projekt-Struktur
-
-```
-python_delet_me/
-├── README.md                 # Diese Dokumentation
-├── esp_sender/
-│   ├── platformio.ini        # PlatformIO Konfiguration
-│   └── src/
-│       └── main.c            # ESP-IDF Firmware
-├── esp_receiver/
-│   ├── platformio.ini        # PlatformIO Konfiguration
-│   └── src/
-│       └── main.c            # ESP-IDF Firmware
-└── pico_bridge/
-    ├── platformio.ini        # PlatformIO Konfiguration
-    └── src/
-        └── main.cpp          # Arduino-Pico Firmware
-```
+Sender ID is per device. Broadcast uses ID 0xFF.
 
 ## Build & Flash
+PlatformIO is required. If `pio` is not in PATH, use:
 
-### Voraussetzungen
-- PlatformIO Core oder VS Code mit PlatformIO Extension
-- USB-Treiber für ESP32-C3 und Pico
+```powershell
+python -m platformio run
+```
 
-### ESP-Sender flashen
+Note (Windows): PlatformIO fails with spaces in project paths. Use a SUBST drive:
+```powershell
+cmd /c 'subst S: "C:\Onedrive\OneDrive - FH JOANNEUM\ChatGPT_CLI\diy_pc_hardware"'
+```
+Then run builds from `S:\`.
+
+Flash ESP sender:
 ```powershell
 cd esp_sender
-pio run -t upload --upload-port COM11
+python -m platformio run -t upload --upload-port COM11
 ```
 
-### ESP-Receiver flashen
+Flash ESP receiver:
 ```powershell
 cd esp_receiver
-pio run -t upload --upload-port COM13
+python -m platformio run -t upload --upload-port COM13
 ```
 
-### Pico flashen
-1. BOOTSEL-Taste gedrückt halten
-2. USB-Kabel einstecken
-3. Firmware kopieren:
+Pico UF2:
 ```powershell
 cd pico_bridge
-pio run
+python -m platformio run
 Copy-Item ".pio\build\pico\firmware.uf2" -Destination "D:\"
 ```
 
-## Konfiguration
+## Configuration
+- Sender MAC + SENDER_ID in `esp_sender/src/main.c`
+- Receiver peer list in `esp_receiver/src/main.c`
+- Key mapping in `esp_sender/src/main.c` (`gpio_to_key`)
 
-### MAC-Adressen anpassen
-
-Die MAC-Adressen müssen in beiden ESP-Firmwares eingetragen werden:
-
-**esp_sender/src/main.c:**
-```c
-// MAC-Adresse des Empfängers
-static uint8_t receiver_mac[6] = {0x20, 0x6e, 0xf1, 0x6a, 0xc4, 0xb0};
+## Dev GUI
+Run:
+```powershell
+python dev_gui.py
 ```
 
-**esp_receiver/src/main.c:**
-```c
-// MAC-Adresse des Senders
-static uint8_t sender_mac[6] = {0x20, 0x6e, 0xf1, 0x6a, 0xa3, 0xb8};
+Features:
+- Flash sender/receiver
+- Build Pico and copy UF2
+- Pico serial control (LED:1 / LED:0)
+
+## Dev CLI
+Examples:
+```powershell
+python dev_tool.py ports
+python dev_tool.py flash-sender --port COM11
+python dev_tool.py flash-receiver --port COM13
+python dev_tool.py build-pico --copy
+python dev_tool.py send --port COM15 "LED:1"
+python dev_tool.py monitor --port COM15
 ```
 
-### MAC-Adresse herausfinden
-Die MAC-Adresse wird beim Start im Serial Monitor ausgegeben:
-```
-Eigene MAC: 20:6e:f1:6a:a3:b8
-```
+Config file (shared by GUI + CLI): `dev_config.json`
 
-### Tasten-Mapping anpassen
+## Tests (Manual)
+- LED: send `LED:1` and `LED:0` via Pico USB serial
+- Keyboard: press GPIO0..GPIO7 and verify USB HID events
 
-**esp_sender/src/main.c:**
-```c
-static char gpio_to_key(uint8_t gpio) {
-    switch(gpio) {
-        case 0: return '0';  // oder 'w' für WASD
-        case 1: return '1';  // oder 'a'
-        case 2: return '2';  // oder 's'
-        case 3: return '3';  // oder 'd'
-        // ... weitere Tasten
-    }
-}
-```
-
-### Sondertasten (Keyboard.h)
-
-Für Sondertasten die Arduino Keyboard-Konstanten verwenden:
-
-```cpp
-// pico_bridge/src/main.cpp
-#include <Keyboard.h>
-
-// Beispiele:
-Keyboard.press(KEY_LEFT_CTRL);
-Keyboard.press(KEY_LEFT_SHIFT);
-Keyboard.press(KEY_LEFT_ALT);
-Keyboard.press(KEY_UP_ARROW);
-Keyboard.press(KEY_RETURN);
-Keyboard.press(KEY_ESC);
-Keyboard.press(KEY_BACKSPACE);
-Keyboard.press(KEY_TAB);
-Keyboard.press(KEY_F1);  // F1-F12
-```
-
-## Features
-
-### Implementiert ✅
-
-- [x] **8 Tasten** (GPIO 0-7) mit Interrupt-basierter Erkennung
-- [x] **Taste halten** - Repeat-Signal alle 50ms für Gaming
-- [x] **Auto-Release** - Timeout nach 150ms falls Signal verloren
-- [x] **Debouncing** - 20ms Software-Debounce
-- [x] **Bidirektionale Kommunikation** - PC kann LED steuern
-- [x] **Hohe Baudrate** - 921600 baud für minimale Latenz
-- [x] **USB HID Keyboard** - Funktioniert mit allen Programmen
-
-### Geplante Erweiterungen
-
-- [ ] **USB HID Maus** - Mouse.h Library
-- [ ] **USB HID Gamepad** - Joystick.h Library
-- [ ] **WS2812 RGB LEDs** - Neopixel-Unterstützung
-- [ ] **Akku-Betrieb** - Deep Sleep Modus
-- [ ] **Mehrere Sender** - Multi-Device Support
-- [ ] **Verschlüsselung** - ESP-NOW Encryption
-- [ ] **OTA Updates** - Firmware Over-the-Air
-
-## Erweiterung: USB Maus
-
-### Pico-Code erweitern
-
-```cpp
-#include <Mouse.h>
-
-void setup() {
-    Mouse.begin();
-    // ...
-}
-
-// Neue Nachrichtentypen:
-// MOUSE:X:Y      → Relative Bewegung
-// MOUSE:C:1      → Linksklick gedrückt
-// MOUSE:C:0      → Linksklick losgelassen
-// MOUSE:R:1      → Rechtsklick gedrückt
-// MOUSE:W:3      → Scroll 3 Einheiten
-
-void parseMouseMessage(char* msg) {
-    if (strncmp(msg, "MOUSE:", 6) != 0) return;
-    
-    char type = msg[6];
-    int value = atoi(&msg[8]);
-    
-    switch(type) {
-        case 'X': Mouse.move(value, 0); break;
-        case 'Y': Mouse.move(0, value); break;
-        case 'C': value ? Mouse.press(MOUSE_LEFT) : Mouse.release(MOUSE_LEFT); break;
-        case 'R': value ? Mouse.press(MOUSE_RIGHT) : Mouse.release(MOUSE_RIGHT); break;
-        case 'W': Mouse.move(0, 0, value); break;
-    }
-}
-```
-
-### ESP-Sender: Joystick/Analog-Eingabe
-
-```c
-#include "driver/adc.h"
-
-// ADC für Joystick
-adc1_config_width(ADC_WIDTH_BIT_12);
-adc1_config_channel_atten(ADC1_CHANNEL_0, ADC_ATTEN_DB_11);  // GPIO0
-
-int x = adc1_get_raw(ADC1_CHANNEL_0);  // 0-4095
-int mapped_x = (x - 2048) / 20;  // -100 bis +100
-
-char msg[32];
-snprintf(msg, sizeof(msg), "MOUSE:X:%d\n", mapped_x);
-esp_now_send(receiver_mac, (uint8_t*)msg, strlen(msg));
-```
-
-## Erweiterung: USB Gamepad
-
-### PlatformIO.ini anpassen
-
-```ini
-[env:pico]
-lib_deps = 
-    Keyboard
-    Joystick  ; oder arduino-libraries/Joystick
-```
-
-### Gamepad-Code
-
-```cpp
-#include <Joystick.h>
-
-Joystick_ Joystick(JOYSTICK_DEFAULT_REPORT_ID, 
-    JOYSTICK_TYPE_GAMEPAD,
-    8,    // Button Count
-    0,    // Hat Switch Count
-    true, // X Axis
-    true, // Y Axis
-    false, false, false, false, false, false, false, false, false);
-
-void setup() {
-    Joystick.begin();
-}
-
-// Nachrichtenformat:
-// PAD:B:0:1    → Button 0 gedrückt
-// PAD:X:512   → X-Achse auf 512 (0-1023)
-// PAD:Y:256   → Y-Achse auf 256
-
-void parsePadMessage(char* msg) {
-    if (strncmp(msg, "PAD:", 4) != 0) return;
-    
-    char type = msg[4];
-    int id = msg[6] - '0';
-    int value = atoi(&msg[8]);
-    
-    switch(type) {
-        case 'B': 
-            Joystick.setButton(id, value); 
-            break;
-        case 'X': 
-            Joystick.setXAxis(value); 
-            break;
-        case 'Y': 
-            Joystick.setYAxis(value); 
-            break;
-    }
-}
-```
-
-## Erweiterung: RGB LEDs (WS2812)
-
-### ESP-Sender mit Neopixel
-
-```c
-#include "led_strip.h"
-
-#define LED_STRIP_GPIO 8
-#define LED_COUNT 10
-
-led_strip_handle_t led_strip;
-
-void rgb_init(void) {
-    led_strip_config_t config = {
-        .strip_gpio_num = LED_STRIP_GPIO,
-        .max_leds = LED_COUNT,
-    };
-    led_strip_rmt_config_t rmt_config = {
-        .resolution_hz = 10 * 1000 * 1000,
-    };
-    led_strip_new_rmt_device(&config, &rmt_config, &led_strip);
-}
-
-// Befehlsformat: RGB:0:255:128:64  → LED 0 auf R=255, G=128, B=64
-void on_data_recv(...) {
-    if (strncmp(data, "RGB:", 4) == 0) {
-        int led, r, g, b;
-        sscanf(data, "RGB:%d:%d:%d:%d", &led, &r, &g, &b);
-        led_strip_set_pixel(led_strip, led, r, g, b);
-        led_strip_refresh(led_strip);
-    }
-}
-```
-
-## Troubleshooting
-
-### Problem: Keine Tasteneingabe
-1. Prüfe UART-Verbindung (TX↔RX, GND)
-2. Prüfe Baudrate (921600)
-3. Prüfe MAC-Adressen in beiden ESP-Firmwares
-4. Serial Monitor auf ESP-Sender/Receiver öffnen
-
-### Problem: Tasten bleiben hängen
-- Timeout ist auf 150ms eingestellt
-- Repeat-Signal wird alle 50ms gesendet
-- Falls weiterhin Problem: Timeout erhöhen
-
-### Problem: LED reagiert nicht
-1. Prüfe GPIO 8 auf ESP-Sender
-2. Teste mit Serial Monitor: `LED:1` senden
-3. Prüfe ob ESP-Receiver Befehl empfängt
-
-### Problem: Hercules sendet nicht korrekt
-- Timeout-Fix ist implementiert (50ms)
-- Einfach `LED:1` eingeben und Send klicken
-- Kein `\n` am Ende nötig
-
-## Latenz-Optimierungen
-
-Das Framework ist für minimale Latenz optimiert:
-
-| Komponente | Optimierung |
-|------------|-------------|
-| GPIO | Interrupt-basiert, kein Polling |
-| Debounce | 20ms, in ISR-Kontext |
-| ESP-NOW | Direktverbindung, kein WiFi-AP |
-| UART | 921600 Baud |
-| Pico | Kein delay() im Loop |
-| USB HID | Native USB, kein CDC-Only |
-
-Geschätzte Gesamtlatenz: **< 5ms**
-
-## Lizenz
-
-MIT License - Frei verwendbar für private und kommerzielle Projekte.
-
-## Autor
-
-Erstellt mit GitHub Copilot, Februar 2026.
+## Roadmap
+- Mouse HID
+- Gamepad HID
+- Multi-sender scaling
+- Encryption/pairing

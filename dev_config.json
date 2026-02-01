@@ -1,0 +1,6 @@
+{
+  "sender_port": "COM11",
+  "receiver_port": "COM13",
+  "pico_port": "COM15",
+  "pico_mount": ""
+}

@@ -1,6 +1,6 @@
 /*
- * ESP32-C3 Sender/Device - Latenz-optimierte Tastatur
- * GPIO-Interrupt für minimale Latenz, sendet KEY:x:1/0 Format
+ * ESP32-C3 Sender/Device - Low-latency HID event source
+ * Sends compact binary frames (versioned) over ESP-NOW.
  */
 
 #include <stdio.h>
@@ -20,24 +20,21 @@
 
 static const char *TAG = "ESP_SENDER";
 
-// Taster GPIO Pins - erweitert für mehr Tasten (GPIO 0-7)
-#define BUTTON_0_GPIO   0
-#define BUTTON_1_GPIO   1
-#define BUTTON_2_GPIO   2
-#define BUTTON_3_GPIO   3
-#define BUTTON_4_GPIO   4
-#define BUTTON_5_GPIO   5
-#define BUTTON_6_GPIO   6
-#define BUTTON_7_GPIO   7
-#define DEBOUNCE_US     20000  // 20ms Debounce in Mikrosekunden
+// GPIOs for buttons (expandable)
+#define NUM_KEYS        8
+static const uint8_t BUTTON_GPIOS[NUM_KEYS] = {0, 1, 2, 3, 4, 5, 6, 7};
+#define DEBOUNCE_US     20000  // 20ms debounce
 
-// Integrierte LED (ESP32-C3 hat LED auf GPIO8)
+// Built-in LED (ESP32-C3 has LED on GPIO8)
 #define LED_GPIO        8
 
-// MAC-Adresse des Empfängers (COM13)
+// Receiver MAC address (dongle)
 static uint8_t receiver_mac[6] = {0x20, 0x6e, 0xf1, 0x6a, 0xc4, 0xb0};
 
-// Event Queue für GPIO Interrupts
+// Sender ID (1..255). Keep stable per device.
+#define SENDER_ID 1
+
+// Event Queue for GPIO interrupts
 static QueueHandle_t gpio_evt_queue = NULL;
 
 typedef struct {
@@ -46,63 +43,135 @@ typedef struct {
     int64_t timestamp;
 } gpio_event_t;
 
-// GPIO zu Taste Mapping (GPIO-Nummer = Taste)
+// GPIO to key mapping (example: '0'..'7')
 static char gpio_to_key(uint8_t gpio) {
-    switch(gpio) {
-        case BUTTON_0_GPIO: return '0';
-        case BUTTON_1_GPIO: return '1';
-        case BUTTON_2_GPIO: return '2';
-        case BUTTON_3_GPIO: return '3';
-        case BUTTON_4_GPIO: return '4';
-        case BUTTON_5_GPIO: return '5';
-        case BUTTON_6_GPIO: return '6';
-        case BUTTON_7_GPIO: return '7';
-        default: return '?';
+    for (int i = 0; i < NUM_KEYS; i++) {
+        if (BUTTON_GPIOS[i] == gpio) {
+            return (char)('0' + i);
+        }
     }
+    return '?';
 }
 
-// ISR Handler - schnellstmöglich, nur Queue befüllen
+// ---- Protocol (binary frame) ----
+#define PROTO_SYNC0 0xA5
+#define PROTO_SYNC1 0x5A
+#define PROTO_VER   1
+#define PROTO_MAX_PAYLOAD 32
+
+typedef enum {
+    MSG_KEY_EVENT = 0x01,   // payload: keycode(1), action(1)
+    MSG_KEY_STATE = 0x02,   // payload: bitmask_lo, bitmask_hi
+    MSG_CONTROL   = 0x10,   // payload: cmd(1), value(1)
+} msg_type_t;
+
+typedef enum {
+    KEY_PRESS   = 1,
+    KEY_RELEASE = 0,
+} key_action_t;
+
+static uint8_t crc8_update(uint8_t crc, uint8_t data) {
+    crc ^= data;
+    for (int i = 0; i < 8; i++) {
+        crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x07) : (uint8_t)(crc << 1);
+    }
+    return crc;
+}
+
+static uint8_t frame_seq = 0;
+
+static void send_frame(uint8_t type, const uint8_t *payload, uint8_t len) {
+    if (len > PROTO_MAX_PAYLOAD) {
+        return;
+    }
+
+    uint8_t frame[7 + PROTO_MAX_PAYLOAD + 1];
+    uint8_t idx = 0;
+    frame[idx++] = PROTO_SYNC0;
+    frame[idx++] = PROTO_SYNC1;
+    frame[idx++] = PROTO_VER;
+    frame[idx++] = type;
+    frame[idx++] = SENDER_ID;
+    frame[idx++] = frame_seq++;
+    frame[idx++] = len;
+
+    uint8_t crc = 0;
+    for (int i = 2; i < idx; i++) {
+        crc = crc8_update(crc, frame[i]);
+    }
+    for (int i = 0; i < len; i++) {
+        frame[idx++] = payload[i];
+        crc = crc8_update(crc, payload[i]);
+    }
+    frame[idx++] = crc;
+
+    esp_now_send(receiver_mac, frame, idx);
+}
+
+// ISR handler - keep it fast
 static void IRAM_ATTR gpio_isr_handler(void* arg) {
     uint8_t gpio = (uint8_t)(uintptr_t)arg;
     gpio_event_t evt = {
         .gpio = gpio,
-        .pressed = (gpio_get_level(gpio) == 0),  // Aktiv LOW
+        .pressed = (gpio_get_level(gpio) == 0),  // Active LOW
         .timestamp = esp_timer_get_time()
     };
     xQueueSendFromISR(gpio_evt_queue, &evt, NULL);
 }
 
-// Callback wenn Daten empfangen - LED Steuerung
+// Callback when data received (control)
 static void on_data_recv(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len) {
-    ESP_LOGI(TAG, "RX: %.*s", len, (char*)data);
-    
-    // LED Befehle verarbeiten: LED:1 oder LED:0
-    if (len >= 5 && strncmp((char*)data, "LED:", 4) == 0) {
-        bool led_state = (data[4] == '1');
-        gpio_set_level(LED_GPIO, led_state);
-        ESP_LOGI(TAG, "LED -> %s", led_state ? "AN" : "AUS");
+    (void)recv_info;
+    if (len < 8) {
+        return;
+    }
+    if (data[0] != PROTO_SYNC0 || data[1] != PROTO_SYNC1) {
+        return;
+    }
+    uint8_t ver = data[2];
+    uint8_t type = data[3];
+    uint8_t payload_len = data[6];
+    if (ver != PROTO_VER || (7 + payload_len + 1) != len) {
+        return;
+    }
+
+    uint8_t crc = 0;
+    for (int i = 2; i < 7 + payload_len; i++) {
+        crc = crc8_update(crc, data[i]);
+    }
+    if (crc != data[7 + payload_len]) {
+        return;
+    }
+
+    // Control: LED command (cmd=1)
+    if (type == MSG_CONTROL && payload_len >= 2) {
+        uint8_t cmd = data[7];
+        uint8_t value = data[8];
+        if (cmd == 1) {
+            gpio_set_level(LED_GPIO, value ? 1 : 0);
+        }
     }
 }
 
-// Callback wenn Daten gesendet
+// Callback when data sent
 static void on_data_sent(const esp_now_send_info_t *send_info, esp_now_send_status_t status) {
-    // Kein Logging für maximale Performance
+    (void)send_info;
+    (void)status;
 }
 
 static void wifi_init(void) {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    
+
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
-    
-    // Eigene MAC ausgeben
+
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    ESP_LOGI(TAG, "Eigene MAC: %02x:%02x:%02x:%02x:%02x:%02x",
+    ESP_LOGI(TAG, "Own MAC: %02x:%02x:%02x:%02x:%02x:%02x",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
@@ -110,8 +179,7 @@ static void espnow_init(void) {
     ESP_ERROR_CHECK(esp_now_init());
     ESP_ERROR_CHECK(esp_now_register_recv_cb(on_data_recv));
     ESP_ERROR_CHECK(esp_now_register_send_cb(on_data_sent));
-    
-    // Peer hinzufügen
+
     esp_now_peer_info_t peer = {
         .channel = 0,
         .ifidx = ESP_IF_WIFI_STA,
@@ -119,116 +187,96 @@ static void espnow_init(void) {
     };
     memcpy(peer.peer_addr, receiver_mac, 6);
     ESP_ERROR_CHECK(esp_now_add_peer(&peer));
-    
-    ESP_LOGI(TAG, "ESP-NOW initialisiert, warte auf Pakete...");
+
+    ESP_LOGI(TAG, "ESP-NOW initialized");
 }
 
-// GPIO für Taster mit Interrupt initialisieren
+// GPIO initialization for buttons
 static void button_init(void) {
-    // Queue für GPIO Events
     gpio_evt_queue = xQueueCreate(20, sizeof(gpio_event_t));
-    
-    // Alle Taster-GPIOs konfigurieren (GPIO 0-7)
+
+    uint64_t mask = 0;
+    for (int i = 0; i < NUM_KEYS; i++) {
+        mask |= (1ULL << BUTTON_GPIOS[i]);
+    }
     gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << BUTTON_0_GPIO) | (1ULL << BUTTON_1_GPIO) |
-                        (1ULL << BUTTON_2_GPIO) | (1ULL << BUTTON_3_GPIO) |
-                        (1ULL << BUTTON_4_GPIO) | (1ULL << BUTTON_5_GPIO) | 
-                        (1ULL << BUTTON_6_GPIO) | (1ULL << BUTTON_7_GPIO),
+        .pin_bit_mask = mask,
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_ANYEDGE,  // Beide Flanken für Press und Release
+        .intr_type = GPIO_INTR_ANYEDGE,
     };
     gpio_config(&io_conf);
-    
-    // ISR Service installieren
+
     gpio_install_isr_service(0);
-    gpio_isr_handler_add(BUTTON_0_GPIO, gpio_isr_handler, (void*)(uintptr_t)BUTTON_0_GPIO);
-    gpio_isr_handler_add(BUTTON_1_GPIO, gpio_isr_handler, (void*)(uintptr_t)BUTTON_1_GPIO);
-    gpio_isr_handler_add(BUTTON_2_GPIO, gpio_isr_handler, (void*)(uintptr_t)BUTTON_2_GPIO);
-    gpio_isr_handler_add(BUTTON_3_GPIO, gpio_isr_handler, (void*)(uintptr_t)BUTTON_3_GPIO);
-    gpio_isr_handler_add(BUTTON_4_GPIO, gpio_isr_handler, (void*)(uintptr_t)BUTTON_4_GPIO);
-    gpio_isr_handler_add(BUTTON_5_GPIO, gpio_isr_handler, (void*)(uintptr_t)BUTTON_5_GPIO);
-    gpio_isr_handler_add(BUTTON_6_GPIO, gpio_isr_handler, (void*)(uintptr_t)BUTTON_6_GPIO);
-    gpio_isr_handler_add(BUTTON_7_GPIO, gpio_isr_handler, (void*)(uintptr_t)BUTTON_7_GPIO);
-    
-    ESP_LOGI(TAG, "Taster GPIO0-7 mit Interrupt initialisiert");
+    for (int i = 0; i < NUM_KEYS; i++) {
+        gpio_isr_handler_add(BUTTON_GPIOS[i], gpio_isr_handler, (void*)(uintptr_t)BUTTON_GPIOS[i]);
+    }
+
+    ESP_LOGI(TAG, "Buttons initialized on GPIO0-7");
 }
 
-// Debounce Tracking pro GPIO
-static int64_t last_event_time[8] = {0};
+// Debounce tracking per GPIO (indexed by GPIO number 0..7)
+static int64_t last_event_time[NUM_KEYS] = {0};
 
-// Tracking welche Tasten gedrückt sind
-static bool key_pressed[8] = {false};
+// Track pressed state by index
+static bool key_pressed[NUM_KEYS] = {false};
 
-// Key Event Task - verarbeitet GPIO Events und sendet KEY:x:1/0
+// Key Event Task
 static void key_event_task(void *arg) {
+    (void)arg;
     gpio_event_t evt;
-    char msg[16];
-    
+
     while (1) {
         if (xQueueReceive(gpio_evt_queue, &evt, pdMS_TO_TICKS(10))) {
-            // Debounce Check
+            if (evt.gpio >= NUM_KEYS) {
+                continue;
+            }
             if ((evt.timestamp - last_event_time[evt.gpio]) < DEBOUNCE_US) {
-                continue;  // Ignoriere Bounce
+                continue;
             }
             last_event_time[evt.gpio] = evt.timestamp;
-            
-            // Status tracken
             key_pressed[evt.gpio] = evt.pressed;
-            
-            // KEY:x:1 für Press, KEY:x:0 für Release
-            char key = gpio_to_key(evt.gpio);
-            snprintf(msg, sizeof(msg), "KEY:%c:%d\n", key, evt.pressed ? 1 : 0);
-            
-            // Sofort senden - ESP-NOW ist schnell
-            esp_now_send(receiver_mac, (uint8_t*)msg, strlen(msg));
-            
-            ESP_LOGI(TAG, "TX: %s", msg);
+
+            uint8_t payload[2];
+            payload[0] = (uint8_t)gpio_to_key(evt.gpio);
+            payload[1] = evt.pressed ? KEY_PRESS : KEY_RELEASE;
+            send_frame(MSG_KEY_EVENT, payload, sizeof(payload));
         }
     }
 }
 
-// Key Repeat Task - sendet alle 50ms ein Signal solange Taste gehalten
-static void key_repeat_task(void *arg) {
-    char msg[16];
-    
+// Periodic key state sync (bitmask) for safety
+static void key_state_task(void *arg) {
+    (void)arg;
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(50));  // Alle 50ms
-        
-        // Prüfe welche GPIOs noch gedrückt sind (hardware check)
-        for (int i = 0; i < 8; i++) {
-            bool currently_pressed = (gpio_get_level(i) == 0);  // Aktiv LOW
-            
-            if (currently_pressed && key_pressed[i]) {
-                // Taste wird gehalten - sende Repeat
-                char key = gpio_to_key(i);
-                snprintf(msg, sizeof(msg), "KEY:%c:1\n", key);
-                esp_now_send(receiver_mac, (uint8_t*)msg, strlen(msg));
-            } else if (!currently_pressed && key_pressed[i]) {
-                // Taste wurde losgelassen aber Event verpasst - sende Release
-                key_pressed[i] = false;
-                char key = gpio_to_key(i);
-                snprintf(msg, sizeof(msg), "KEY:%c:0\n", key);
-                esp_now_send(receiver_mac, (uint8_t*)msg, strlen(msg));
-                ESP_LOGI(TAG, "TX (missed release): %s", msg);
+        vTaskDelay(pdMS_TO_TICKS(100));
+
+        uint16_t mask = 0;
+        for (int i = 0; i < NUM_KEYS; i++) {
+            bool currently_pressed = (gpio_get_level(BUTTON_GPIOS[i]) == 0);
+            if (currently_pressed) {
+                mask |= (1U << i);
             }
         }
+
+        uint8_t payload[2];
+        payload[0] = (uint8_t)(mask & 0xFF);
+        payload[1] = (uint8_t)((mask >> 8) & 0xFF);
+        send_frame(MSG_KEY_STATE, payload, sizeof(payload));
     }
 }
 
 void app_main(void) {
-    // NVS initialisieren
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
-    
-    ESP_LOGI(TAG, "=== ESP-NOW SENDER - BIDIREKTIONAL ===");
-    
-    // LED GPIO initialisieren
+
+    ESP_LOGI(TAG, "=== ESP-NOW SENDER ===");
+
     gpio_config_t led_conf = {
         .pin_bit_mask = (1ULL << LED_GPIO),
         .mode = GPIO_MODE_OUTPUT,
@@ -237,18 +285,14 @@ void app_main(void) {
         .intr_type = GPIO_INTR_DISABLE,
     };
     gpio_config(&led_conf);
-    gpio_set_level(LED_GPIO, 0);  // LED aus
-    
+    gpio_set_level(LED_GPIO, 0);
+
     wifi_init();
     espnow_init();
     button_init();
-    
-    // High-Priority Task für Key Events
-    xTaskCreate(key_event_task, "key_evt", 2048, NULL, 10, NULL);  // Priorität 10 = hoch
-    
-    // Key Repeat Task für gehaltene Tasten
-    xTaskCreate(key_repeat_task, "key_repeat", 2048, NULL, 5, NULL);  // Priorität 5
-    
-    ESP_LOGI(TAG, "Bereit! GPIO0='0', GPIO1='1', GPIO2='2', GPIO3='3'");
-    ESP_LOGI(TAG, "LED auf GPIO%d steuerbar via LED:1/LED:0", LED_GPIO);
+
+    xTaskCreate(key_event_task, "key_evt", 2048, NULL, 10, NULL);
+    xTaskCreate(key_state_task, "key_state", 2048, NULL, 4, NULL);
+
+    ESP_LOGI(TAG, "Ready. Sender ID=%d, LED GPIO=%d", SENDER_ID, LED_GPIO);
 }

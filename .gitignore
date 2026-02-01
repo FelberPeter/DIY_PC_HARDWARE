@@ -1,5 +1,8 @@
 # PlatformIO
 .pio/
+*/CMakeLists.txt
+*/src/CMakeLists.txt
+*/sdkconfig.*
 
 # Python
 .venv/
